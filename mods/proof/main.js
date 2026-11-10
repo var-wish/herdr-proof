@@ -1,9 +1,9 @@
-// Proof: one card per space, with the branch and whether its latest check
+// Proof: one row per space, with the branch and whether its latest check
 // still applies. Evidence lives in <worktree>/.proof (see the repo README).
 // Git is read, never written. Run and Shot are the only writers, and only
-// under .proof.
+// under .proof. The panel is a Herdr list (mark + label), not status bars.
 
-import { View, div, image } from "gpui-kit";
+import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { agents, appHome, exec, panes, props, readTextFile, run, shared, spaces, theme, watchFolder, window, writeTextFile } from "herdr";
 import {
@@ -13,6 +13,7 @@ import {
   configuredCommand,
   copyShotAllowed,
   formatAheadBehind,
+  formatWhen,
   hasEvidence,
   isImage,
   manifestJson,
@@ -177,6 +178,38 @@ function agentLine(spaceId) {
   return `${name} · ${top.status}${extra}`;
 }
 
+function headerSummary(counts) {
+  const urgent = [];
+  if (counts.failing) urgent.push(`${counts.failing} failing`);
+  if (counts.stale) urgent.push(`${counts.stale} stale`);
+  if (counts.unverified) urgent.push(`${counts.unverified} unverified`);
+  if (urgent.length) return urgent.join(" · ");
+  if (counts.verified) return "All verified";
+  return "";
+}
+
+function footerCounts(spaceCount, counts) {
+  if (!spaceCount) return "";
+  const parts = [`${spaceCount} space${spaceCount === 1 ? "" : "s"}`];
+  if (counts.failing) parts.push(`${counts.failing} failing`);
+  else if (counts.stale) parts.push(`${counts.stale} stale`);
+  else if (counts.unverified) parts.push(`${counts.unverified} unverified`);
+  return parts.join(" · ");
+}
+
+function metaBits(card, head, now) {
+  const bits = [];
+  if (!card) return ["…"];
+  if (!card.cwd) bits.push("No folder");
+  else bits.push(branchLabel(head));
+  const ahead = head?.kind === "repo" ? formatAheadBehind(head.ahead, head.behind) : "";
+  if (ahead) bits.push(ahead);
+  const when = hasEvidence(card.evidence) ? formatWhen(card.evidence.at, now) : "";
+  if (when) bits.push(when);
+  else if (!hasEvidence(card.evidence) && card.cwd) bits.push("No evidence");
+  return bits;
+}
+
 // Missing updates() is an old build, not a reason to blank the panel.
 async function probeVersion() {
   try {
@@ -204,6 +237,7 @@ export default class Proof extends View {
     this.version = null;
     this.unsupported = false;
     this.manualOnly = false;
+    this.width = null;
     this.sig = signature();
     this.refresh(cx);
     cx.spawn(async (cx) => {
@@ -452,43 +486,112 @@ export default class Proof extends View {
     });
   }
 
-  button(id, label, enabled, action) {
+  // Shape + label so a verdict never relies on color alone (Agents / Triage pattern).
+  verdictMark(t, verdict) {
+    const color = verdict ? tone(t, verdict) : t.dim;
+    if (verdict === "failing") {
+      return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold()
+        .text_color(t.blocked).flex().items_center().justify_center().child("!");
+    }
+    if (verdict === "verified") {
+      return div().size(7).mx(3).flex_none().rounded(4).bg(color);
+    }
+    // stale + unverified (+ unknown): hollow ring
+    return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(color);
+  }
+
+  verdictTag(t, verdict) {
+    const label = verdict ? VERDICTS[verdict] : "…";
+    if (!verdict || verdict === "unverified") {
+      return div().flex_none().h(16).px(5).rounded(4).bg(t.raised).text_size(10.5).font_medium()
+        .text_color(t.muted).flex().items_center().child(label);
+    }
+    const color = tone(t, verdict);
+    return div().flex_none().h(16).px(5).rounded(4).bg(color + "1f").text_size(10.5).font_medium()
+      .text_color(color).flex().items_center().child(label);
+  }
+
+  dirtyChip(t) {
+    return div().flex_none().h(16).px(5).rounded(4).bg(t.working + "1f").text_size(10.5).font_medium()
+      .text_color(t.working).flex().items_center().child("dirty");
+  }
+
+  primaryButton(id, label, enabled, action) {
     const t = theme();
     return div().id(id).h(28).px(10).flex().items_center().rounded(7).flex_none().text_size(12)
       .bg(enabled ? t.solid : t.raised).text_color(enabled ? t.solid_foreground : t.dim)
-      .when(enabled, (el) => el.cursor_pointer().hover((style) => style.opacity(0.85)))
+      .when(enabled, (el) => el.cursor_pointer().hover((style) => style.opacity(0.9)))
       .on_click((_event, cx) => { if (enabled) action(cx); })
       .child(label);
   }
 
-  card(space, t, now) {
+  secondaryButton(id, label, enabled, action) {
+    const t = theme();
+    return div().id(id).h(28).px(10).flex().items_center().rounded(7).flex_none().text_size(12)
+      .bg(t.raised).text_color(enabled ? t.foreground : t.dim)
+      .when(enabled, (el) => el.cursor_pointer().hover((style) => style.bg(t.hover)))
+      .on_click((_event, cx) => { if (enabled) action(cx); })
+      .child(label);
+  }
+
+  evidenceThumb(card, t) {
+    if (card?.image) {
+      return div().h(56).w_full().rounded(6).overflow_hidden().border_1().border_color(t.border).bg(t.canvas)
+        .child(image(card.image).w_full().h(56));
+    }
+    const shot = card?.evidence?.shot;
+    if (shot) {
+      return div().h(20).px(6).rounded(4).bg(t.raised).text_size(11).text_color(t.muted).truncate()
+        .tooltip(shot).child(shot);
+    }
+    return null;
+  }
+
+  // Compact rail: mark only, tooltip carries name · verdict · branch.
+  railRow(space, t, now) {
     const card = this.cards[space.id];
     const head = card?.head;
     const verdict = head ? verdictFor(head, card.evidence, card.command) : null;
-    const color = verdict ? tone(t, verdict) : t.dim;
     const where = !card ? "…" : !card.cwd ? "No folder" : branchLabel(head);
-    const counts = head?.kind === "repo" ? formatAheadBehind(head.ahead, head.behind) : "";
-    const who = agentLine(space.id);
-    const artifact = card?.evidence?.shot || card?.evidence?.log || "";
-    return v_flex().id(`proof-${space.id}`).flex_none().p(8).gap(4).rounded(8).border_1().border_color(space.active ? t.accent : t.border)
-      .bg(space.active ? t.selected : t.background).cursor_pointer()
+    const tip = [space.name, verdict ? VERDICTS[verdict] : "…", where].filter(Boolean).join(" · ");
+    return h_flex().id(`proof-${space.id}`).h(28).flex_none().mx(6).rounded(6).items_center().justify_center()
+      .cursor_pointer().tooltip(tip)
+      .when(space.active, (el) => el.bg(t.selected))
       .hover((style) => style.bg(space.active ? t.selected : t.hover))
       .on_click(() => run("space.select", { id: space.id }))
-      .child(h_flex().gap(8).items_center()
-        .when(Boolean(space.status), (el) => el.child(div().size(6).rounded(3).flex_none().bg(t[space.status] || t.dim)))
-        .child(div().flex_1().min_w(0).truncate().font_semibold().text_color(t.foreground).child(space.name))
-        .child(div().flex_none().px(6).py(1).rounded(4).text_size(10).font_semibold().text_color(color).bg(`${color}22`).child(verdict ? VERDICTS[verdict] : "…")))
-      .child(h_flex().gap(6).items_center().text_size(11).text_color(t.muted)
-        .child(div().min_w(0).truncate().child(where))
-        .when(Boolean(counts), (el) => el.child(div().flex_none().text_color(t.foreground).child(counts)))
-        .when(Boolean(head?.dirty || card?.evidence?.dirty), (el) => el.child(div().flex_none().text_color(t.working).child("dirty")))
-        .when(Boolean(who), (el) => el.child(div().flex_1().min_w(0).truncate().text_right().child(who))))
-      .child(div().text_size(11).text_color(t.dim).truncate().tooltip(card ? runLine(card.evidence, now) : "").child(card ? runLine(card.evidence, now) : "Checking…"))
-      .when(Boolean(artifact), (el) => el.child(div().text_size(11).text_color(t.muted).truncate().child(artifact)))
-      .when(Boolean(card?.error), (el) => el.child(div().text_size(11).text_color(t.blocked).truncate().tooltip(card.error).child(card.error)))
-      .when(Boolean(card?.image), (el) => el.child(
-        div().h(72).w_full().mt(2).rounded(6).overflow_hidden().bg(t.canvas).child(image(card.image).w_full().h(72)),
-      ));
+      .child(this.verdictMark(t, verdict));
+  }
+
+  row(space, t, now, { showThumb }) {
+    const card = this.cards[space.id];
+    const head = card?.head;
+    const verdict = head ? verdictFor(head, card.evidence, card.command) : null;
+    const dirty = Boolean(head?.dirty || card?.evidence?.dirty);
+    const who = agentLine(space.id);
+    const bits = metaBits(card, head, now);
+    const tip = card ? runLine(card.evidence, now) : "";
+    const thumb = showThumb && space.active ? this.evidenceThumb(card, t) : null;
+    return v_flex().id(`proof-${space.id}`).flex_none().mx(6).gap(0)
+      .child(h_flex().h(44).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer()
+        .when(space.active, (el) => el.bg(t.selected))
+        .hover((style) => style.bg(space.active ? t.selected : t.hover))
+        .on_click(() => run("space.select", { id: space.id }))
+        .child(h_flex().w(14).flex_none().items_center().justify_center().child(this.verdictMark(t, verdict)))
+        .child(v_flex().flex_1().min_w(0).gap(2)
+          .child(h_flex().gap(6).items_center()
+            .when(Boolean(space.status), (el) => el.child(div().size(6).rounded(3).flex_none().bg(t[space.status] || t.dim)))
+            .child(div().min_w(0).flex_1().truncate().text_size(12.5).font_medium().text_color(t.foreground).child(space.name))
+            .child(this.verdictTag(t, verdict)))
+          .child(h_flex().gap(6).items_center().text_size(11).text_color(t.dim)
+            .child(div().min_w(0).truncate().tooltip(tip).child(bits.join(" · ")))
+            .when(dirty, (el) => el.child(this.dirtyChip(t)))
+            .when(Boolean(who), (el) => el.child(div().flex_none().max_w(80).truncate().text_right().child(who))))))
+      .when(space.active, (el) => el.child(
+        v_flex().mx(0).mb(6).px(8).py(6).gap(4).rounded(7).bg(t.background)
+          .child(div().text_size(11).text_color(t.dim).truncate().tooltip(tip).child(tip || "Checking…"))
+          .when(Boolean(card?.error), (row) => row.child(
+            div().text_size(11).text_color(t.blocked).truncate().tooltip(card.error).child(card.error)))
+          .when(Boolean(thumb), (row) => row.child(thumb))));
   }
 
   render(cx) {
@@ -514,31 +617,58 @@ export default class Proof extends View {
       const known = this.cards[space.id];
       if (known?.head) counts[verdictFor(known.head, known.evidence, known.command)]++;
     }
-    const summary = Object.entries(counts).filter(([, n]) => n > 0).map(([name, n]) => `${n} ${name}`).join(" · ");
+    const width = this.width ?? 320;
+    const rail = width < 200;
+    const showSummary = width >= 280;
+    const showThumb = width >= 280;
+    const summary = headerSummary(counts);
     const busy = active ? this.busy[active.id] : null;
     const canRun = Boolean(card?.command && card.root && !busy);
     const canShot = Boolean(card?.root && !busy);
     const canOpen = Boolean(card?.root && !busy);
     const note = active ? this.notes[active.id] : "";
+    const refreshTip = this.manualOnly ? "Refresh only" : "Refresh";
     return v_flex().id("proof").size_full().min_h(0).bg(t.chrome).text_color(t.foreground).text_size(12)
-      .child(h_flex().h(40).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border)
-        .child(div().font_semibold().child("Proof"))
-        .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(summary || (list.length ? "Checking…" : "")))
-        .child(div().id("proof-refresh").flex_none().text_size(11).text_color(t.muted).cursor_pointer()
-          .hover((style) => style.text_color(t.foreground))
-          .on_click((_event, clickCx) => this.refresh(clickCx)).child(this.manualOnly ? "Refresh only" : "Refresh")))
+      .on_size_change((size, sizeCx) => {
+        const next = Math.round(size?.width ?? 0);
+        if (!next || next === this.width) return;
+        this.width = next;
+        sizeCx.notify();
+      })
+      .child(h_flex().h(42).flex_none().px(rail ? 0 : 14).gap(8).items_center().border_b(1).border_color(t.border)
+        .when(rail, (el) => el.justify_center())
+        .when(!rail, (el) => el
+          .child(div().text_size(13).font_semibold().child("Proof"))
+          .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim)
+            .child(showSummary ? (summary || (list.length && this.loading ? "Checking…" : "")) : "")))
+        .child(div().id("proof-refresh").size(24).flex_none().flex().items_center().justify_center().rounded(6)
+          .tooltip(refreshTip)
+          .cursor_pointer().hover((style) => style.bg(t.hover))
+          .on_click((_event, clickCx) => this.refresh(clickCx))
+          .child(this.loading
+            ? svg("mods/workspace-chrome/spinner.svg").size(14).text_color(t.muted).spin(900)
+            : div().text_size(12).text_color(t.muted).child("↻"))))
       .child(div().flex_1().min_h(0).relative()
-        .child(v_flex().id("proof-list").absolute().inset_0().overflow_y_scroll().p(8).gap(8)
-          .children(list.map((space) => this.card(space, t, now)))
-          .when(!list.length, (el) => el.child(div().p(8).text_color(t.dim).child("No spaces yet.")))))
-      .child(v_flex().flex_none().px(10).py(8).gap(6).border_t(1).border_color(t.border)
-        .child(div().text_size(11).text_color(t.dim).whitespace_normal()
-          .tooltip(card?.command || "")
-          .child(active ? (card?.command ? card.command : "No command — set the layout's command, or shared proof.command") : "No space"))
-        .when(Boolean(note), (el) => el.child(div().text_size(11).text_color(t.blocked).truncate().tooltip(note).child(note)))
+        .child(v_flex().id("proof-list").absolute().inset_0().overflow_y_scroll().py(6).gap(rail ? 2 : 0)
+          .children(list.map((space) => (rail
+            ? this.railRow(space, t, now)
+            : this.row(space, t, now, { showThumb }))))
+          .when(!list.length, (el) => el.child(
+            v_flex().px(14).py(16).gap(4).items_center()
+              .child(div().text_size(12).text_color(t.dim).child("No spaces yet"))
+              .child(div().text_size(12).text_color(t.dim).whitespace_normal().text_center()
+                .child("Open a space with a folder to see verification for its branch."))))))
+      .when(!rail, (el) => el.child(v_flex().flex_none().px(10).py(8).gap(6).border_t(1).border_color(t.border)
+        .child(h_flex().gap(8).items_center().text_size(11).text_color(t.dim)
+          .child(div().flex_1().min_w(0).truncate().tooltip(card?.command || "")
+            .child(active
+              ? (card?.command ? card.command : "No command — set the layout's command, or shared proof.command")
+              : "No space"))
+          .child(div().flex_none().child(footerCounts(list.length, counts))))
+        .when(Boolean(note), (row) => row.child(div().text_size(11).text_color(t.blocked).truncate().tooltip(note).child(note)))
         .child(h_flex().gap(6)
-          .child(this.button("proof-run", busy === "run" ? "Running…" : "Run", canRun, (clickCx) => this.runCheck(active.id, clickCx)))
-          .child(this.button("proof-open", "Open", canOpen, (clickCx) => this.openEvidence(active.id, clickCx)))
-          .child(this.button("proof-shot", busy === "shot" ? "Saving…" : "Shot", canShot, (clickCx) => this.takeShot(active.id, clickCx)))));
+          .child(this.primaryButton("proof-run", busy === "run" ? "Running…" : "Run", canRun, (clickCx) => this.runCheck(active.id, clickCx)))
+          .child(this.secondaryButton("proof-open", "Open", canOpen, (clickCx) => this.openEvidence(active.id, clickCx)))
+          .child(this.secondaryButton("proof-shot", busy === "shot" ? "Saving…" : "Shot", canShot, (clickCx) => this.takeShot(active.id, clickCx))))));
   }
 }
