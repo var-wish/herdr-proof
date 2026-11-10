@@ -13,7 +13,7 @@ The list scrolls, with 8px of padding and 8px between cards. A card is a rounded
 Each card, top to bottom:
 
 - The space's status dot, 6px, only when an agent in it has a status. The name, semibold, then a 10px pill: Verified in `done`, Failing in `blocked`, Stale in `working`, Unverified in `dim`. The pill's fill is that color with `22` alpha.
-- An 11px muted line: the branch, or `No git`, `detached` plus the first 7 hex digits of HEAD, `Git unavailable`, `No commits`, or `No folder`. Then `↑n` and `↓n` in the foreground when those counts are greater than zero. `dirty` in the working color when the worktree has tracked or untracked changes, or the recorded run has `dirty: true`. The most urgent agent, right aligned, as `Claude Code · working`, with ` +n` when more than one agent is in the space.
+- An 11px muted line: the branch, or `No git`, `detached` plus the first 7 hex digits of HEAD, `Git unavailable`, `No commits`, or `No folder`. Then `↑n` and `↓n` in the foreground when those counts are greater than zero. `dirty` in the working color when the worktree has tracked or untracked changes outside `.proof`, when `git status` failed, or the recorded run has `dirty: true`. A submodule with `ignore = all` is not reported by Git, so its changes do not show as dirty. The most urgent agent, right aligned, as `Claude Code · working`, with ` +n` when more than one agent is in the space.
 - An 11px dim line: the command, `pass` or `fail`, `dirty` when the run recorded it, a relative time (`just now`, `5m ago`, `2h ago`, `3d ago`, otherwise the date), and the duration (`800ms`, `4.2s`, `13s`, `1m 5s`). No evidence reads `No evidence`. Before the first read the card says `Checking…`.
 - The log or shot path, 11px muted, when one is set.
 - A blocked error line when `latest.json` cannot be read, or git failed.
@@ -27,7 +27,7 @@ No spaces: `No spaces yet.` On a Herdr older than 0.1.14 the panel shows that re
 
 Verified is the configured command passing on this exact commit with a clean tree.
 
-- Verified: `ok` is a pass, `command` equals the person's command, `commit` matches HEAD, `dirty` is not true, and the worktree is clean now (no tracked or untracked changes).
+- Verified: `ok` is a pass, `command` equals the person's command, `commit` matches HEAD, `dirty` is not true, and `git status` succeeded with a clean tree apart from `.proof`.
 - Failing: `commit` matches HEAD and `ok` is a failure. A dirty tree can still be Failing.
 - Stale: `commit` names a different commit. The line under the branch still says pass or fail.
 - Unverified: no evidence, no `commit` inside a git repo, a pass with no git commit, a dirty tree that would otherwise be Verified, a command other than the one configured, or git could not be read.
@@ -38,7 +38,7 @@ Agent status is only the label on the card. blocked, then done, then working, th
 
 Clicking a card runs `space.select`. Refresh reads again. The footer follows the active space.
 
-Run executes only the command from `props.command` or shared `proof.command`, in the git toplevel (the folder, when there is no git). It writes `.proof/last.log` and `.proof/latest.json` with `v: 1` and `dirty` from a fresh `git status`, and keeps an existing screenshot. A timeout is a failure with the note `timed out`. A command longer than 240 characters is not run.
+Run executes only the command from `props.command` or shared `proof.command`, in the git toplevel (the folder, when there is no git). It writes `.proof/last.log` and `.proof/latest.json` with `v: 1` and `dirty` from a fresh `git status` that excludes `.proof`. A nonzero status is stored as `dirty: true`. It keeps an existing screenshot. A timeout is a failure with the note `timed out`. A command longer than 240 characters is not run.
 
 Open launches the shot, else the log, only when the extension is png, jpg, jpeg, gif, webp, log, or txt and the path is not a symlink. Every other path opens the `.proof` directory.
 
@@ -48,15 +48,15 @@ Git and `.proof` are reread every 10 seconds, and when the space's folder change
 
 ## Built from
 
-One mod, `mods/proof/`, with `main.js`, `logic.js`, and `mod.json` (`place: "right"`, `size: 320`, `herdr: "0.1.14"`). Herdr 0.1.14 ignores the `herdr` key. The panel reads `updates().app.version` and, below 0.1.14 or when that call fails, draws the requirement and stops. No layout file and no `keys.json`. `logic.js` is pure and is what `node --test` imports. `main.js` default-exports a `View`.
+One mod, `mods/proof/`, with `main.js`, `logic.js`, and `mod.json` (`place: "right"`, `size: 320`, `herdr: "0.1.14"`). Herdr 0.1.14 ignores the `herdr` key. The panel imports `updates` only if it is there. Below 0.1.14 it draws the requirement and stops. If `updates` is missing, it keeps the panel and does not start the 10s timer: Refresh is manual. No layout file and no `keys.json`. `logic.js` is pure and is what `node --test` imports. `main.js` default-exports a `View`.
 
 The folder for a space is its first terminal's live cwd, otherwise `space.folder`. Evidence is read at `git rev-parse --show-toplevel`, or at that folder when git says it is not a repository.
 
-Git calls, all with `--no-optional-locks` and `core.fsmonitor=false`: `rev-parse --show-toplevel`, `symbolic-ref -q HEAD`, `rev-list --left-right --count HEAD...@{upstream}`, `rev-parse --verify HEAD`, `log -1 --format=%cI`, `status --porcelain=v1` (untracked files count as dirty).
+Git calls, all with `--no-optional-locks` and `core.fsmonitor=false`: `rev-parse --show-toplevel`, `symbolic-ref -q HEAD`, `rev-list --left-right --count HEAD...@{upstream}`, `rev-parse --verify HEAD`, `log -1 --format=%cI`, `status --porcelain=v1 -- . :!.proof` (untracked files count as dirty; `.proof` does not; a nonzero status is dirty).
 
 Herdr: `spaces`, `panes`, `agents`, `theme`, `exec`, `readTextFile`, `writeTextFile`, `watchFolder`, `appHome`, `props`, `shared`, `run`, `window`, `updates`. The only app command is `space.select`.
 
-Programs: `git`, `sh -c` (Windows `cmd /c`) for the person's command only, `mkdir`, `rm`, `cp -P`, `test -L`, `herdr-app shot`, and `xdg-open` / `open` / `cmd /c start`. A space on another machine writes files through `python3`. Screenshots that are regular image files are copied to `data/proof/<space-id>.<ext>` under the app home so `image()` can draw them. Symlinks are not copied and not opened. `latest.json` wins when it exists. Otherwise the newest of the last 32 `.proof/runs/*.json` files is used.
+Programs: `git`, `sh -c` (Windows `cmd /c`) for the person's command only, `mkdir`, `rm`, `cp -P`, `test -f`, `realpath -e`, `herdr-app shot`, and `xdg-open` / `open` / `cmd /c start`. Open runs only when `test -f` succeeds and `realpath` of the file stays inside `realpath` of `.proof`. A directory named like an image, or a symlink that leaves that directory, opens the folder. A space on another machine writes files through `python3`. Screenshots that are regular image files are copied to `data/proof/<space-id>.<ext>` under the app home so `image()` can draw them. Symlinks are not copied. `latest.json` wins when it exists. Otherwise the newest of the last 32 `.proof/runs/*.json` files is used.
 
 The command Run uses is `props.command`, else shared `proof.command`. `timeout_ms` on the props or shared `proof.timeout_ms` defaults to 120000 and is clamped to 1000–600000. `.proof/config.json` is not read.
 

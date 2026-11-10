@@ -12,14 +12,18 @@ import {
   manifestJson,
   mergeShot,
   openChoice,
+  pathStaysUnder,
   parseAheadBehind,
   parseBranch,
   parseManifest,
   pickLatest,
+  resolvedOpen,
   runLine,
   runRecord,
   safeRel,
   sameCommit,
+  statusArgs,
+  statusIsDirty,
   summarizeGit,
   trimLog,
   verdictFor,
@@ -171,6 +175,33 @@ test("a dirty tree is not verified, including untracked files", () => {
   assert.equal(verdictFor(head, evidence(), CMD), "unverified");
 });
 
+test("a failed git status is dirty and is not recorded as clean", () => {
+  assert.equal(statusIsDirty("", 128), true);
+  assert.equal(statusIsDirty("", 1), true);
+  assert.equal(statusIsDirty(undefined, undefined), true);
+  assert.equal(statusIsDirty("", 0), false);
+  assert.equal(statusIsDirty("?? x\n", 0), true);
+  const head = summarizeGit({
+    root: "/wt",
+    branchStdout: "refs/heads/main\n",
+    branchCode: 0,
+    countsStdout: "",
+    countsCode: 128,
+    shaStdout: `${SHA}\n`,
+    shaCode: 0,
+    whenStdout: "2026-11-10T03:00:00.000Z\n",
+    whenCode: 0,
+    dirtyStdout: "",
+    dirtyCode: 128,
+    dirtyStderr: "fatal: not a valid object name",
+  });
+  assert.equal(head.dirty, true);
+  assert.match(head.error, /git status failed|not a valid object name/);
+  assert.equal(verdictFor(head, evidence(), CMD), "unverified");
+  const recorded = runRecord({ command: CMD, exitCode: 0, startedMs: 0, finishedMs: 1, sha: SHA, dirty: head.dirty });
+  assert.equal(recorded.dirty, true);
+});
+
 test("verdict is failing when that commit's run failed", () => {
   assert.equal(verdictFor(repo(), evidence({ ok: false }), CMD), "failing");
   assert.equal(verdictFor(repo({ dirty: true }), evidence({ ok: false }), CMD), "failing");
@@ -315,6 +346,15 @@ test("a hostile repository cannot pick Run, open a script, or earn Verified", ()
   assert.equal(copyShotAllowed("shots/evil.sh"), false);
   assert.equal(copyShotAllowed("shots/pass.png", { symlink: true }), false);
   assert.equal(copyShotAllowed("shots/pass.png"), true);
+  assert.equal(pathStaysUnder("/work/.proof", "/work/.proof/shots/a.png"), true);
+  assert.equal(pathStaysUnder("/work/.proof", "/work/.proof-evil/a.png"), false);
+  assert.equal(pathStaysUnder("/work/.proof", "/etc/passwd"), false);
+  const repoRoot = "/work/repo";
+  const shot = { shot: "shots/x.png" };
+  assert.equal(resolvedOpen(repoRoot, shot, { isFile: false, realFile: `${repoRoot}/.proof/shots/x.png`, realDir: `${repoRoot}/.proof` }).kind, "dir");
+  assert.equal(resolvedOpen(repoRoot, shot, { isFile: true, realFile: "/tmp/elsewhere/x.png", realDir: `${repoRoot}/.proof` }).kind, "dir");
+  assert.equal(resolvedOpen(repoRoot, shot, { isFile: true, realFile: `${repoRoot}/.proof/shots/x.png`, realDir: `${repoRoot}/.proof` }).path, `${repoRoot}/.proof/shots/x.png`);
+  assert.deepEqual(statusArgs(), ["status", "--porcelain=v1", "--", ".", ":!.proof"]);
   assert.equal(parseManifest("x".repeat(64 * 1024 + 1)).error, "Manifest is too large");
   assert.equal(parseManifest('{"v":2,"ok":true,"commit":"abcdef0"}').error, "Unsupported proof version");
   assert.equal(parseManifest('{"ok":true,"commit":"abcdef0"}').manifest.v, 1);

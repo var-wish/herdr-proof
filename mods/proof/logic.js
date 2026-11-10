@@ -211,13 +211,28 @@ export function parseAheadBehind(stdout, code) {
   return { ahead: parts[0], behind: parts[1] };
 }
 
-export function summarizeGit({ root, branchStdout, branchCode, countsStdout, countsCode, shaStdout, shaCode, whenStdout, whenCode, dirtyStdout, dirtyCode }) {
+// Pathspec from the worktree root. `.proof` is evidence Proof itself writes,
+// so an un-ignored `.proof` must not by itself block Verified.
+export function statusArgs() {
+  return ["status", "--porcelain=v1", "--", ".", ":!.proof"];
+}
+
+// A failed status (exit 128, a thrown read, no code) is dirty. Never treat
+// that as a clean tree.
+export function statusIsDirty(stdout, code) {
+  if (code !== 0) return true;
+  return String(stdout ?? "").trim().length > 0;
+}
+
+export function summarizeGit({ root, branchStdout, branchCode, countsStdout, countsCode, shaStdout, shaCode, whenStdout, whenCode, dirtyStdout, dirtyCode, dirtyStderr }) {
   if (!root) {
-    return { kind: "none", branch: null, detached: false, sha: null, committedAt: null, ahead: null, behind: null, dirty: false, root: null };
+    return { kind: "none", branch: null, detached: false, sha: null, committedAt: null, ahead: null, behind: null, dirty: false, error: null, root: null };
   }
   const branch = parseBranch(branchStdout, branchCode);
   const counts = parseAheadBehind(countsStdout, countsCode);
   const when = whenCode === 0 ? parseWhen(String(whenStdout ?? "").trim(), Date.now() + SKEW_MS) : null;
+  const dirty = statusIsDirty(dirtyStdout, dirtyCode);
+  const failed = dirtyCode !== 0;
   return {
     kind: "repo",
     branch: branch.branch,
@@ -226,9 +241,28 @@ export function summarizeGit({ root, branchStdout, branchCode, countsStdout, cou
     committedAt: when,
     ahead: counts.ahead,
     behind: counts.behind,
-    dirty: dirtyCode === 0 && String(dirtyStdout ?? "").trim().length > 0,
+    dirty,
+    error: failed ? (cleanText(String(dirtyStderr || "git status failed"), 160) || "git status failed") : null,
     root,
   };
+}
+
+export function pathStaysUnder(parent, child) {
+  if (typeof parent !== "string" || typeof child !== "string") return false;
+  const base = parent.replace(/\/+$/, "");
+  const target = child.replace(/\/+$/, "");
+  if (!base || !target) return false;
+  return target.startsWith(`${base}/`);
+}
+
+// Open a regular file only when its real path is still inside this .proof.
+// A directory named x.png, or a symlink that leaves the directory, opens the folder.
+export function resolvedOpen(root, evidence, facts = {}) {
+  const dir = `${String(root || "").replace(/\/+$/, "")}/.proof`;
+  const choice = openChoice(root, evidence);
+  if (choice.kind !== "file" || !facts.isFile) return { path: dir, kind: "dir" };
+  if (!pathStaysUnder(facts.realDir, facts.realFile)) return { path: dir, kind: "dir" };
+  return { path: facts.realFile, kind: "file" };
 }
 
 function commitTied(head, evidence) {

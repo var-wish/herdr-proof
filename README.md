@@ -2,7 +2,7 @@
 
 Proof is a [Herdr](https://herdr.dev) side panel. For each space it shows the branch and the latest check recorded in `.proof/`. **Verified** means only this: the command you configured passed on this exact commit, and the worktree was clean. It does not mean the change is correct.
 
-The panel reads git and `.proof`. It does not use the network. A repository cannot choose the Run command, and it cannot earn Verified by writing a timestamp or a script path.
+The panel reads git and `.proof`. It does not use the network. A repository cannot choose the Run command, and it cannot earn Verified by writing a timestamp or a script path. If this Herdr has no `updates()` function, the panel still works and refreshes only when you click Refresh.
 
 ## Install
 
@@ -38,7 +38,7 @@ One card per space:
 
 - Branch, or `No git`, `detached` plus seven hex digits, `Git unavailable`, or `No folder`.
 - `↑n` / `↓n` when the branch is ahead of or behind its upstream. Zeros are omitted. No upstream shows neither.
-- `dirty` when the worktree has tracked or untracked changes, or the recorded run says it was dirty.
+- `dirty` when the worktree has tracked or untracked changes outside `.proof`, when `git status` fails, or when the recorded run says it was dirty. `.proof` itself is left out of that check, so writing the evidence does not by itself block Verified. A submodule with `ignore = all` is also left out: Git does not report its changes, so they do not mark the tree dirty.
 - The most urgent agent in the space, when there is one.
 - The last check: command, pass or fail, when, duration.
 - The log or screenshot path, and the picture when the shot is a png, jpg, webp, or gif and not a symlink.
@@ -56,7 +56,7 @@ A missing `commit` inside a repository is Unverified, not Stale. `at` is not a s
 
 ## The `.proof` convention
 
-Add `.proof/` to the repository's `.gitignore`. A committed `.proof` travels with a clone and is how a repo would try to ship a fake badge or a path for Open to launch. The panel still reads a gitignored `.proof`. On Linux a gitignored directory may not be watchable; the panel rereads it every 10 seconds.
+Add `.proof/` to the repository's `.gitignore`. A committed `.proof` travels with a clone and is how a repo would try to ship a fake badge or a path for Open to launch. The panel still reads a gitignored `.proof`, and it does not count `.proof` itself as a dirty file. On Linux a gitignored directory may not be watchable; the panel rereads it every 10 seconds. A submodule set to `ignore = all` is a separate gap: `git status` hides it, so Proof will not call that tree dirty.
 
 Agents write this at the git toplevel (the folder itself, when it is not a repository). One file is enough.
 
@@ -83,7 +83,7 @@ Agents write this at the git toplevel (the folder itself, when it is not a repos
 - `at`: ISO-8601 time the run finished. Times more than two minutes ahead are ignored.
 - `duration_ms`: how long it took.
 - `commit`: `git rev-parse HEAD` for the tree you checked. Required for Verified. Prefer the full sha.
-- `dirty`: `true` when the tree was dirty at the run. Verified requires `false` or absent, and a clean tree now. Run always writes this.
+- `dirty`: `true` when the tree was dirty at the run, or when `git status` could not be read. Verified requires `false` or absent, and a clean tree now. Run always writes this, and a failed status is recorded as dirty.
 - `log` and `shot`: paths relative to `.proof/`. No absolute paths, no `..`. Open will launch only png, jpg, jpeg, gif, webp, log, and txt. Anything else opens the folder.
 - `note`: one short line. Control characters and bidi marks are stripped.
 

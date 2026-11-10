@@ -5,7 +5,7 @@
 
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, appHome, exec, panes, props, readTextFile, run, shared, spaces, theme, updates, watchFolder, window, writeTextFile } from "herdr";
+import { agents, appHome, exec, panes, props, readTextFile, run, shared, spaces, theme, watchFolder, window, writeTextFile } from "herdr";
 import {
   MIN_HERDR,
   VERDICTS,
@@ -21,8 +21,10 @@ import {
   parseManifest,
   pickLatest,
   resolveUnder,
+  resolvedOpen,
   runLine,
   runRecord,
+  statusArgs,
   summarizeGit,
   trimLog,
   verdictFor,
@@ -58,7 +60,7 @@ async function readGit(cwd, on) {
     git(root, on, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]),
     git(root, on, ["rev-parse", "--verify", "HEAD"]),
     git(root, on, ["log", "-1", "--format=%cI"]),
-    git(root, on, ["status", "--porcelain=v1"]),
+    git(root, on, statusArgs()),
   ]);
   return summarizeGit({
     root,
@@ -72,6 +74,7 @@ async function readGit(cwd, on) {
     whenCode: when.code,
     dirtyStdout: dirty.stdout,
     dirtyCode: dirty.code,
+    dirtyStderr: dirty.stderr,
   });
 }
 
@@ -174,12 +177,16 @@ function agentLine(spaceId) {
   return `${name} · ${top.status}${extra}`;
 }
 
-function herdrVersion() {
+// Missing updates() is an old build, not a reason to blank the panel.
+async function probeVersion() {
   try {
-    const version = updates()?.app?.version;
-    return typeof version === "string" ? version : null;
+    const herdr = await import("herdr");
+    if (typeof herdr.updates !== "function") return { missing: true };
+    const version = herdr.updates()?.app?.version;
+    if (typeof version !== "string" || !version) return { missing: true };
+    return { missing: false, version };
   } catch {
-    return null;
+    return { missing: true };
   }
 }
 
@@ -194,12 +201,27 @@ export default class Proof extends View {
     this.loading = false;
     this.again = false;
     this.gen = 0;
-    this.version = herdrVersion();
-    this.unsupported = !this.version || versionBelow(this.version, MIN_HERDR);
-    if (this.unsupported) return;
+    this.version = null;
+    this.unsupported = false;
+    this.manualOnly = false;
     this.sig = signature();
     this.refresh(cx);
-    cx.timer.every(POLL_MS, (cx) => this.refresh(cx));
+    cx.spawn(async (cx) => {
+      const probed = await probeVersion();
+      if (probed.missing) {
+        this.manualOnly = true;
+        cx.notify();
+        return;
+      }
+      if (versionBelow(probed.version, MIN_HERDR)) {
+        this.unsupported = true;
+        this.version = probed.version;
+        cx.notify();
+        return;
+      }
+      this.version = probed.version;
+      cx.timer.every(POLL_MS, (cx) => this.refresh(cx));
+    });
   }
 
   refresh(cx) {
@@ -334,7 +356,7 @@ export default class Proof extends View {
         const head = await readGit(card.root, card.on);
         if (head.kind === "repo") {
           sha = head.sha;
-          dirty = head.dirty === true;
+          dirty = head.dirty !== false;
         } else if (head.kind === "none") {
           sha = null;
           dirty = false;
@@ -395,17 +417,32 @@ export default class Proof extends View {
     });
   }
 
+  async resolveOpen(card) {
+    const dir = `${card.root}/.proof`;
+    try {
+      const choice = openChoice(card.root, card.evidence);
+      if (choice.kind !== "file") return dir;
+      const file = await exec("test", ["-f", choice.path], { on: card.on, timeout: 4000 });
+      const [realFile, realDir] = await Promise.all([
+        exec("realpath", ["-e", choice.path], { on: card.on, timeout: 4000 }),
+        exec("realpath", ["-e", dir], { on: card.on, timeout: 4000 }),
+      ]);
+      return resolvedOpen(card.root, card.evidence, {
+        isFile: file.code === 0,
+        realFile: realFile.code === 0 ? realFile.stdout.trim() : "",
+        realDir: realDir.code === 0 ? realDir.stdout.trim() : "",
+      }).path;
+    } catch {
+      return dir;
+    }
+  }
+
   openEvidence(spaceId, cx) {
     const card = this.cards[spaceId];
     if (!card?.root) return;
-    const choice = openChoice(card.root, card.evidence);
     cx.spawn(async (cx) => {
       try {
-        let target = choice.path;
-        if (choice.kind === "file") {
-          const link = await exec("test", ["-L", target], { on: card.on, timeout: 4000 });
-          if (link.code !== 1) target = `${card.root}/.proof`;
-        }
+        const target = await this.resolveOpen(card);
         const result = await openPath(target, card.on);
         this.notes[spaceId] = result.code === 0 ? "" : (result.stderr || "Could not open").trim().slice(0, 160);
       } catch (error) {
@@ -461,10 +498,12 @@ export default class Proof extends View {
         .child(div().font_semibold().child("Proof"))
         .child(div().text_color(t.muted).child(this.version ? `Needs Herdr ${MIN_HERDR} or newer (this one is ${this.version}).` : `Needs Herdr ${MIN_HERDR} or newer.`));
     }
-    const sig = signature();
-    if (sig !== this.sig) {
-      this.sig = sig;
-      this.refresh(cx);
+    if (!this.manualOnly) {
+      const sig = signature();
+      if (sig !== this.sig) {
+        this.sig = sig;
+        this.refresh(cx);
+      }
     }
     const now = Date.now();
     const list = spaces();
@@ -487,7 +526,7 @@ export default class Proof extends View {
         .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(summary || (list.length ? "Checking…" : "")))
         .child(div().id("proof-refresh").flex_none().text_size(11).text_color(t.muted).cursor_pointer()
           .hover((style) => style.text_color(t.foreground))
-          .on_click((_event, clickCx) => this.refresh(clickCx)).child("Refresh")))
+          .on_click((_event, clickCx) => this.refresh(clickCx)).child(this.manualOnly ? "Refresh only" : "Refresh")))
       .child(div().flex_1().min_h(0).relative()
         .child(v_flex().id("proof-list").absolute().inset_0().overflow_y_scroll().p(8).gap(8)
           .children(list.map((space) => this.card(space, t, now)))
