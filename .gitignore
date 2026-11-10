@@ -1,0 +1,6 @@
+node_modules/
+.proof/
+herdr-shot.png
+# Herdr writes these beside a mod when the folder is installed.
+jsconfig.json
+*.d.ts

@@ -1,0 +1,505 @@
+// Proof: one card per space, with the branch and whether its latest check
+// still applies. Evidence lives in <worktree>/.proof (see the repo README).
+// Git is read, never written. Run and Shot are the only writers, and only
+// under .proof.
+
+import { View, div, image } from "gpui-kit";
+import { v_flex, h_flex } from "gpui-base";
+import { agents, appHome, exec, panes, props, readTextFile, run, shared, spaces, theme, updates, watchFolder, window, writeTextFile } from "herdr";
+import {
+  MIN_HERDR,
+  VERDICTS,
+  branchLabel,
+  configuredCommand,
+  copyShotAllowed,
+  formatAheadBehind,
+  hasEvidence,
+  isImage,
+  manifestJson,
+  mergeShot,
+  openChoice,
+  parseManifest,
+  pickLatest,
+  resolveUnder,
+  runLine,
+  runRecord,
+  summarizeGit,
+  trimLog,
+  verdictFor,
+  versionBelow,
+} from "./logic.js";
+
+const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false"];
+const POLL_MS = 10000;
+
+function place(space, paneList) {
+  const tabs = new Set((space.tabs ?? []).map((tab) => tab.id));
+  return paneList.find((pane) => tabs.has(pane.tab) && pane.cwd)?.cwd || space.folder || null;
+}
+
+function signature() {
+  const paneList = panes();
+  return spaces().map((space) => `${space.id}\t${space.machine ?? ""}\t${place(space, paneList) ?? ""}`).join("\n");
+}
+
+function git(cwd, on, args) {
+  return exec("git", [...READ, ...args], { cwd, on, timeout: 8000 });
+}
+
+async function readGit(cwd, on) {
+  const top = await git(cwd, on, ["rev-parse", "--path-format=absolute", "--show-toplevel"]);
+  if (top.code !== 0) {
+    if (/not a git repository/i.test(`${top.stderr}\n${top.stdout}`)) return summarizeGit({ root: null });
+    return { kind: "unsure", error: (top.stderr || top.stdout || "git failed").trim().slice(0, 160) };
+  }
+  const root = top.stdout.replace(/\n$/, "");
+  const [branch, counts, sha, when, dirty] = await Promise.all([
+    git(root, on, ["symbolic-ref", "-q", "HEAD"]),
+    git(root, on, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]),
+    git(root, on, ["rev-parse", "--verify", "HEAD"]),
+    git(root, on, ["log", "-1", "--format=%cI"]),
+    git(root, on, ["status", "--porcelain=v1"]),
+  ]);
+  return summarizeGit({
+    root,
+    branchStdout: branch.stdout,
+    branchCode: branch.code,
+    countsStdout: counts.stdout,
+    countsCode: counts.code,
+    shaStdout: sha.stdout,
+    shaCode: sha.code,
+    whenStdout: when.stdout,
+    whenCode: when.code,
+    dirtyStdout: dirty.stdout,
+    dirtyCode: dirty.code,
+  });
+}
+
+const MAX_TEXT = 64 * 1024;
+
+// readTextFile already stops at 1 MiB. Refuse anything past our own cap
+// before it can be parsed into a badge.
+function bounded(text) {
+  if (text == null) return null;
+  if (text.length > MAX_TEXT) return null;
+  return text;
+}
+
+async function readProof(root, on) {
+  const dir = `${root}/.proof`;
+  const latestFull = await readTextFile(`${dir}/latest.json`, { on });
+  if (latestFull != null) {
+    const latestRaw = bounded(latestFull);
+    if (latestRaw == null) return { dir, evidence: null, error: "Manifest is too large" };
+    const parsed = parseManifest(latestRaw);
+    if (parsed.manifest) return { dir, evidence: parsed.manifest, error: null };
+    return { dir, evidence: null, error: parsed.error };
+  }
+  let listing;
+  try {
+    listing = await exec("sh", ["-c", "ls -1 .proof/runs/*.json 2>/dev/null"], { cwd: root, on, timeout: 8000 });
+  } catch {
+    listing = { code: 1, stdout: "" };
+  }
+  if (!listing.stdout?.trim()) return { dir, evidence: null, error: null };
+  const manifests = [];
+  for (const name of listing.stdout.trim().split("\n").slice(-32)) {
+    const rel = name.trim().replace(/^\.\//, "");
+    if (!rel) continue;
+    const text = bounded(await readTextFile(`${root}/${rel}`, { on }));
+    if (text == null) continue;
+    const parsed = parseManifest(text);
+    if (parsed.manifest) manifests.push(parsed.manifest);
+  }
+  return { dir, evidence: pickLatest(manifests), error: null };
+}
+
+async function putFile(path, text, on) {
+  if (on) {
+    const result = await exec("python3", ["-c", "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(sys.argv[2])", path, text], { on, timeout: 8000 });
+    if (result.code !== 0) throw new Error((result.stderr || "could not write").trim());
+    return;
+  }
+  let last;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const prev = await readTextFile(path);
+    try {
+      await writeTextFile(path, text, prev);
+      return;
+    } catch (error) {
+      last = error;
+    }
+  }
+  throw last;
+}
+
+function shell(command, cwd, on, timeout) {
+  if (window().platform === "windows") return exec("cmd", ["/d", "/c", command], { cwd, on, timeout });
+  return exec("sh", ["-c", command], { cwd, on, timeout });
+}
+
+async function shotFile(dest) {
+  try {
+    return await exec("herdr-app", ["shot", dest], { timeout: 20000 });
+  } catch {
+    return exec(`${homeBin()}/herdr-app`, ["shot", dest], { timeout: 20000 });
+  }
+}
+
+function homeBin() {
+  return `${appHome().replace(/\/\.config\/herdr-app\/?$/, "")}/.local/bin`;
+}
+
+function openPath(path, on) {
+  const platform = window().platform;
+  if (platform === "macos") return exec("open", [path], { on, timeout: 8000 });
+  if (platform === "windows") return exec("cmd", ["/d", "/c", "start", "", path], { on, timeout: 8000 });
+  return exec("xdg-open", [path], { on, timeout: 8000 });
+}
+
+function tone(t, verdict) {
+  if (verdict === "verified") return t.done;
+  if (verdict === "failing") return t.blocked;
+  if (verdict === "stale") return t.working;
+  return t.dim;
+}
+
+function agentLine(spaceId) {
+  const list = agents().filter((agent) => agent.space === spaceId);
+  if (!list.length) return "";
+  const rank = { blocked: 0, done: 1, working: 2, idle: 3 };
+  const top = [...list].sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9))[0];
+  const name = top.program?.name || top.app || "agent";
+  const extra = list.length > 1 ? ` +${list.length - 1}` : "";
+  return `${name} · ${top.status}${extra}`;
+}
+
+function herdrVersion() {
+  try {
+    const version = updates()?.app?.version;
+    return typeof version === "string" ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+export default class Proof extends View {
+  init(_props, cx) {
+    this.cards = {};
+    this.busy = {};
+    this.notes = {};
+    this.copied = {};
+    this.watching = new Set();
+    this.unwatchable = new Set();
+    this.loading = false;
+    this.again = false;
+    this.gen = 0;
+    this.version = herdrVersion();
+    this.unsupported = !this.version || versionBelow(this.version, MIN_HERDR);
+    if (this.unsupported) return;
+    this.sig = signature();
+    this.refresh(cx);
+    cx.timer.every(POLL_MS, (cx) => this.refresh(cx));
+  }
+
+  refresh(cx) {
+    this.again = true;
+    if (this.loading) return;
+    this.loading = true;
+    const gen = ++this.gen;
+    cx.spawn(async (cx) => {
+      try {
+        do {
+          this.again = false;
+          const paneList = panes();
+          const list = spaces();
+          for (const space of list) {
+            if (gen !== this.gen) return;
+            await this.load(space, paneList, cx, gen);
+            if (gen === this.gen) cx.notify();
+          }
+          if (gen !== this.gen) return;
+          const ids = new Set(list.map((space) => space.id));
+          for (const id of Object.keys(this.cards)) if (!ids.has(id)) delete this.cards[id];
+        } while (this.again && gen === this.gen);
+      } finally {
+        if (gen === this.gen) this.loading = false;
+        if (this.again && gen === this.gen) this.refresh(cx);
+      }
+    });
+  }
+
+  async load(space, paneList, cx, gen) {
+    const cwd = place(space, paneList);
+    const on = space.machine ?? null;
+    const previous = this.cards[space.id];
+    if (!cwd) {
+      this.cards[space.id] = { cwd: null, on, root: null, head: { kind: "none" }, evidence: null, error: null, command: null, timeout: 120000, image: null };
+      return;
+    }
+    let head;
+    try {
+      head = await readGit(cwd, on);
+    } catch (error) {
+      head = { kind: "unsure", error: String(error?.message || error).slice(0, 160) };
+    }
+    if (gen !== this.gen) return;
+    if (head.kind === "unsure" && previous?.head?.kind === "repo") head = previous.head;
+    const root = head.root || cwd;
+    let proof = { dir: `${root}/.proof`, evidence: null, error: null };
+    try {
+      proof = await readProof(root, on);
+    } catch (error) {
+      proof.error = String(error?.message || error).slice(0, 160);
+    }
+    if (gen !== this.gen) return;
+    // The repository's .proof/config.json is not consulted. Only the layout
+    // props and the shared setting, both chosen by the person, can name Run.
+    const config = configuredCommand(props()?.command, shared("proof.command"), {
+      propTimeout: props()?.timeout_ms,
+      sharedTimeout: shared("proof.timeout_ms"),
+    });
+    let imagePath = previous?.image ?? null;
+    if (hasEvidence(proof.evidence) && isImage(proof.evidence.shot)) {
+      imagePath = await this.cacheShot(space.id, root, proof.evidence, on) ?? imagePath;
+    }
+    this.cards[space.id] = {
+      cwd,
+      on,
+      root,
+      head,
+      evidence: proof.evidence,
+      error: proof.error || config.error || head.error || "",
+      command: config.command,
+      timeout: config.timeout_ms,
+      image: imagePath,
+    };
+    if (!on) this.ensureWatch(proof.dir, cx);
+  }
+
+  ensureWatch(dir, cx) {
+    if (!dir || this.watching.has(dir) || this.unwatchable.has(dir)) return;
+    this.watching.add(dir);
+    cx.spawn(async (cx) => {
+      try {
+        while (this.watching.has(dir)) {
+          await watchFolder(dir);
+          if (this.watching.has(dir)) this.refresh(cx);
+        }
+      } catch {
+        this.watching.delete(dir);
+        this.unwatchable.add(dir);
+      }
+    });
+  }
+
+  async cacheShot(spaceId, root, manifest, on) {
+    if (on) return null;
+    const abs = resolveUnder(root, manifest.shot);
+    if (!abs) return null;
+    if (this.copied[spaceId] === abs) {
+      const ext = manifest.shot.split(".").pop().toLowerCase();
+      return `data/proof/${spaceId.replace(/[^A-Za-z0-9_-]/g, "_")}.${ext}`;
+    }
+    const ext = manifest.shot.split(".").pop().toLowerCase();
+    const rel = `data/proof/${spaceId.replace(/[^A-Za-z0-9_-]/g, "_")}.${ext}`;
+    const dest = `${appHome()}/${rel}`;
+    try {
+      const link = await exec("test", ["-L", abs], { timeout: 4000 });
+      if (!copyShotAllowed(manifest.shot, { symlink: link.code === 0 })) return null;
+      await exec("mkdir", ["-p", `${appHome()}/data/proof`]);
+      // Remove our cache file first. `cp -P` does not follow a source symlink,
+      // and skipping -f means we never replace a symlink by writing through it.
+      await exec("rm", ["-f", dest]);
+      const copied = await exec("cp", ["-P", abs, dest]);
+      if (copied.code !== 0) return null;
+      this.copied[spaceId] = abs;
+      return rel;
+    } catch {
+      return null;
+    }
+  }
+
+  runCheck(spaceId, cx) {
+    const card = this.cards[spaceId];
+    if (!card?.command || !card.root || this.busy[spaceId]) return;
+    this.busy[spaceId] = "run";
+    this.notes[spaceId] = "";
+    cx.notify();
+    cx.spawn(async (cx) => {
+      const started = Date.now();
+      let sha = card.head?.sha ?? null;
+      let dirty = true;
+      try {
+        const head = await readGit(card.root, card.on);
+        if (head.kind === "repo") {
+          sha = head.sha;
+          dirty = head.dirty === true;
+        } else if (head.kind === "none") {
+          sha = null;
+          dirty = false;
+        }
+      } catch {
+        dirty = true;
+      }
+      let result;
+      try {
+        result = await shell(card.command, card.root, card.on, card.timeout);
+      } catch (error) {
+        result = { code: 1, stdout: "", stderr: String(error?.message || error) };
+      }
+      const record = runRecord({
+        command: card.command,
+        exitCode: result.code,
+        startedMs: started,
+        finishedMs: Date.now(),
+        sha,
+        dirty,
+        note: /timed out|timeout/i.test(result.stderr || "") ? "timed out" : null,
+      });
+      // A new run replaces the result and keeps the last screenshot until Shot.
+      if (card.evidence?.shot) record.shot = card.evidence.shot;
+      try {
+        await exec("mkdir", ["-p", `${card.root}/.proof`], { cwd: card.root, on: card.on });
+        await putFile(`${card.root}/.proof/last.log`, trimLog(result.stdout, result.stderr), card.on);
+        await putFile(`${card.root}/.proof/latest.json`, manifestJson(record), card.on);
+      } catch (error) {
+        this.notes[spaceId] = String(error?.message || error).slice(0, 160);
+      }
+      this.busy[spaceId] = null;
+      this.refresh(cx);
+      cx.notify();
+    });
+  }
+
+  takeShot(spaceId, cx) {
+    const card = this.cards[spaceId];
+    if (!card?.root || this.busy[spaceId]) return;
+    this.busy[spaceId] = "shot";
+    this.notes[spaceId] = "";
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const rel = `shots/${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
+        await exec("mkdir", ["-p", `${card.root}/.proof/shots`], { cwd: card.root, on: card.on });
+        const result = await shotFile(`${card.root}/.proof/${rel}`);
+        if (result.code !== 0) throw new Error((result.stderr || result.stdout || "shot failed").trim());
+        const next = mergeShot(card.evidence, rel, { sha: card.head?.sha, at: new Date().toISOString() });
+        await putFile(`${card.root}/.proof/latest.json`, manifestJson(next), card.on);
+      } catch (error) {
+        this.notes[spaceId] = String(error?.message || error).slice(0, 160);
+      }
+      this.busy[spaceId] = null;
+      this.refresh(cx);
+      cx.notify();
+    });
+  }
+
+  openEvidence(spaceId, cx) {
+    const card = this.cards[spaceId];
+    if (!card?.root) return;
+    const choice = openChoice(card.root, card.evidence);
+    cx.spawn(async (cx) => {
+      try {
+        let target = choice.path;
+        if (choice.kind === "file") {
+          const link = await exec("test", ["-L", target], { on: card.on, timeout: 4000 });
+          if (link.code !== 1) target = `${card.root}/.proof`;
+        }
+        const result = await openPath(target, card.on);
+        this.notes[spaceId] = result.code === 0 ? "" : (result.stderr || "Could not open").trim().slice(0, 160);
+      } catch (error) {
+        this.notes[spaceId] = String(error?.message || error).slice(0, 160);
+      }
+      cx.notify();
+    });
+  }
+
+  button(id, label, enabled, action) {
+    const t = theme();
+    return div().id(id).h(28).px(10).flex().items_center().rounded(7).flex_none().text_size(12)
+      .bg(enabled ? t.solid : t.raised).text_color(enabled ? t.solid_foreground : t.dim)
+      .when(enabled, (el) => el.cursor_pointer().hover((style) => style.opacity(0.85)))
+      .on_click((_event, cx) => { if (enabled) action(cx); })
+      .child(label);
+  }
+
+  card(space, t, now) {
+    const card = this.cards[space.id];
+    const head = card?.head;
+    const verdict = head ? verdictFor(head, card.evidence, card.command) : null;
+    const color = verdict ? tone(t, verdict) : t.dim;
+    const where = !card ? "…" : !card.cwd ? "No folder" : branchLabel(head);
+    const counts = head?.kind === "repo" ? formatAheadBehind(head.ahead, head.behind) : "";
+    const who = agentLine(space.id);
+    const artifact = card?.evidence?.shot || card?.evidence?.log || "";
+    return v_flex().id(`proof-${space.id}`).flex_none().p(8).gap(4).rounded(8).border_1().border_color(space.active ? t.accent : t.border)
+      .bg(space.active ? t.selected : t.background).cursor_pointer()
+      .hover((style) => style.bg(space.active ? t.selected : t.hover))
+      .on_click(() => run("space.select", { id: space.id }))
+      .child(h_flex().gap(8).items_center()
+        .when(Boolean(space.status), (el) => el.child(div().size(6).rounded(3).flex_none().bg(t[space.status] || t.dim)))
+        .child(div().flex_1().min_w(0).truncate().font_semibold().text_color(t.foreground).child(space.name))
+        .child(div().flex_none().px(6).py(1).rounded(4).text_size(10).font_semibold().text_color(color).bg(`${color}22`).child(verdict ? VERDICTS[verdict] : "…")))
+      .child(h_flex().gap(6).items_center().text_size(11).text_color(t.muted)
+        .child(div().min_w(0).truncate().child(where))
+        .when(Boolean(counts), (el) => el.child(div().flex_none().text_color(t.foreground).child(counts)))
+        .when(Boolean(head?.dirty || card?.evidence?.dirty), (el) => el.child(div().flex_none().text_color(t.working).child("dirty")))
+        .when(Boolean(who), (el) => el.child(div().flex_1().min_w(0).truncate().text_right().child(who))))
+      .child(div().text_size(11).text_color(t.dim).truncate().tooltip(card ? runLine(card.evidence, now) : "").child(card ? runLine(card.evidence, now) : "Checking…"))
+      .when(Boolean(artifact), (el) => el.child(div().text_size(11).text_color(t.muted).truncate().child(artifact)))
+      .when(Boolean(card?.error), (el) => el.child(div().text_size(11).text_color(t.blocked).truncate().tooltip(card.error).child(card.error)))
+      .when(Boolean(card?.image), (el) => el.child(
+        div().h(72).w_full().mt(2).rounded(6).overflow_hidden().bg(t.canvas).child(image(card.image).w_full().h(72)),
+      ));
+  }
+
+  render(cx) {
+    const t = theme();
+    if (this.unsupported) {
+      return v_flex().id("proof").size_full().p(12).gap(6).bg(t.chrome).text_color(t.foreground).text_size(12)
+        .child(div().font_semibold().child("Proof"))
+        .child(div().text_color(t.muted).child(this.version ? `Needs Herdr ${MIN_HERDR} or newer (this one is ${this.version}).` : `Needs Herdr ${MIN_HERDR} or newer.`));
+    }
+    const sig = signature();
+    if (sig !== this.sig) {
+      this.sig = sig;
+      this.refresh(cx);
+    }
+    const now = Date.now();
+    const list = spaces();
+    const active = list.find((space) => space.active) ?? list[0] ?? null;
+    const card = active ? this.cards[active.id] : null;
+    const counts = { verified: 0, unverified: 0, stale: 0, failing: 0 };
+    for (const space of list) {
+      const known = this.cards[space.id];
+      if (known?.head) counts[verdictFor(known.head, known.evidence, known.command)]++;
+    }
+    const summary = Object.entries(counts).filter(([, n]) => n > 0).map(([name, n]) => `${n} ${name}`).join(" · ");
+    const busy = active ? this.busy[active.id] : null;
+    const canRun = Boolean(card?.command && card.root && !busy);
+    const canShot = Boolean(card?.root && !busy);
+    const canOpen = Boolean(card?.root && !busy);
+    const note = active ? this.notes[active.id] : "";
+    return v_flex().id("proof").size_full().min_h(0).bg(t.chrome).text_color(t.foreground).text_size(12)
+      .child(h_flex().h(40).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border)
+        .child(div().font_semibold().child("Proof"))
+        .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(summary || (list.length ? "Checking…" : "")))
+        .child(div().id("proof-refresh").flex_none().text_size(11).text_color(t.muted).cursor_pointer()
+          .hover((style) => style.text_color(t.foreground))
+          .on_click((_event, clickCx) => this.refresh(clickCx)).child("Refresh")))
+      .child(div().flex_1().min_h(0).relative()
+        .child(v_flex().id("proof-list").absolute().inset_0().overflow_y_scroll().p(8).gap(8)
+          .children(list.map((space) => this.card(space, t, now)))
+          .when(!list.length, (el) => el.child(div().p(8).text_color(t.dim).child("No spaces yet.")))))
+      .child(v_flex().flex_none().px(10).py(8).gap(6).border_t(1).border_color(t.border)
+        .child(div().text_size(11).text_color(t.dim).whitespace_normal()
+          .tooltip(card?.command || "")
+          .child(active ? (card?.command ? card.command : "No command — set the layout's command, or shared proof.command") : "No space"))
+        .when(Boolean(note), (el) => el.child(div().text_size(11).text_color(t.blocked).truncate().tooltip(note).child(note)))
+        .child(h_flex().gap(6)
+          .child(this.button("proof-run", busy === "run" ? "Running…" : "Run", canRun, (clickCx) => this.runCheck(active.id, clickCx)))
+          .child(this.button("proof-open", "Open", canOpen, (clickCx) => this.openEvidence(active.id, clickCx)))
+          .child(this.button("proof-shot", busy === "shot" ? "Saving…" : "Shot", canShot, (clickCx) => this.takeShot(active.id, clickCx)))));
+  }
+}

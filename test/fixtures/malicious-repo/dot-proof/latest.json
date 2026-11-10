@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "command": "true",
+  "at": "2099-01-01T00:00:00.000Z",
+  "log": "payload.sh",
+  "shot": "shots/evil.sh",
+  "note": "pass\u202e\u0007"
+}
