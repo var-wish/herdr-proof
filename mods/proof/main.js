@@ -496,7 +496,12 @@ export default class Proof extends View {
     if (verdict === "verified") {
       return div().size(7).mx(3).flex_none().rounded(4).bg(color);
     }
-    // stale + unverified (+ unknown): hollow ring
+    // Stale: framed "~" square. Unverified: hollow ring. Shape differs, not only color.
+    if (verdict === "stale") {
+      return div().size(14).flex_none().rounded(3).border(1.5).border_color(color)
+        .flex().items_center().justify_center()
+        .child(div().text_size(9).font_bold().text_color(color).child("~"));
+    }
     return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(color);
   }
 
@@ -553,13 +558,16 @@ export default class Proof extends View {
     const head = card?.head;
     const verdict = head ? verdictFor(head, card.evidence, card.command) : null;
     const where = !card ? "…" : !card.cwd ? "No folder" : branchLabel(head);
-    const tip = [space.name, verdict ? VERDICTS[verdict] : "…", where].filter(Boolean).join(" · ");
-    return h_flex().id(`proof-${space.id}`).h(28).flex_none().mx(6).rounded(6).items_center().justify_center()
+    const err = card?.error || "";
+    const tip = [space.name, verdict ? VERDICTS[verdict] : "…", where, err].filter(Boolean).join(" · ");
+    return h_flex().id(`proof-${space.id}`).h(28).flex_none().mx(6).rounded(6).items_center().justify_center().gap(2)
       .cursor_pointer().tooltip(tip)
       .when(space.active, (el) => el.bg(t.selected))
       .hover((style) => style.bg(space.active ? t.selected : t.hover))
       .on_click(() => run("space.select", { id: space.id }))
-      .child(this.verdictMark(t, verdict));
+      .child(this.verdictMark(t, verdict))
+      .when(Boolean(err), (el) => el.child(
+        div().size(6).flex_none().rounded(3).bg(t.blocked).tooltip(err)));
   }
 
   row(space, t, now, { showThumb }) {
@@ -570,6 +578,7 @@ export default class Proof extends View {
     const who = agentLine(space.id);
     const bits = metaBits(card, head, now);
     const tip = card ? runLine(card.evidence, now) : "";
+    const err = card?.error || "";
     const thumb = showThumb && space.active ? this.evidenceThumb(card, t) : null;
     return v_flex().id(`proof-${space.id}`).flex_none().mx(6).gap(0)
       .child(h_flex().h(44).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer()
@@ -585,12 +594,14 @@ export default class Proof extends View {
           .child(h_flex().gap(6).items_center().text_size(11).text_color(t.dim)
             .child(div().min_w(0).truncate().tooltip(tip).child(bits.join(" · ")))
             .when(dirty, (el) => el.child(this.dirtyChip(t)))
-            .when(Boolean(who), (el) => el.child(div().flex_none().max_w(80).truncate().text_right().child(who))))))
+            .when(Boolean(who), (el) => el.child(div().flex_none().max_w(80).truncate().text_right().child(who))))
+          .when(Boolean(err) && !space.active, (el) => el.child(
+            div().text_size(11).text_color(t.blocked).truncate().tooltip(err).child(err)))))
       .when(space.active, (el) => el.child(
         v_flex().mx(0).mb(6).px(8).py(6).gap(4).rounded(7).bg(t.background)
           .child(div().text_size(11).text_color(t.dim).truncate().tooltip(tip).child(tip || "Checking…"))
-          .when(Boolean(card?.error), (row) => row.child(
-            div().text_size(11).text_color(t.blocked).truncate().tooltip(card.error).child(card.error)))
+          .when(Boolean(err), (row) => row.child(
+            div().text_size(11).text_color(t.blocked).truncate().tooltip(err).child(err)))
           .when(Boolean(thumb), (row) => row.child(thumb))));
   }
 
@@ -646,7 +657,7 @@ export default class Proof extends View {
           .cursor_pointer().hover((style) => style.bg(t.hover))
           .on_click((_event, clickCx) => this.refresh(clickCx))
           .child(this.loading
-            ? svg("mods/workspace-chrome/spinner.svg").size(14).text_color(t.muted).spin(900)
+            ? svg("mods/proof/spinner.svg").size(14).text_color(t.muted).spin(900)
             : div().text_size(12).text_color(t.muted).child("↻"))))
       .child(div().flex_1().min_h(0).relative()
         .child(v_flex().id("proof-list").absolute().inset_0().overflow_y_scroll().py(6).gap(rail ? 2 : 0)
@@ -659,8 +670,8 @@ export default class Proof extends View {
               .child(div().text_size(12).text_color(t.dim).whitespace_normal().text_center()
                 .child("Open a space with a folder to see verification for its branch."))))))
       .when(!rail, (el) => el.child(v_flex().flex_none().px(10).py(8).gap(6).border_t(1).border_color(t.border)
-        .child(h_flex().gap(8).items_center().text_size(11).text_color(t.dim)
-          .child(div().flex_1().min_w(0).truncate().tooltip(card?.command || "")
+        .child(h_flex().gap(8).items_start().text_size(11).text_color(t.dim)
+          .child(div().flex_1().min_w(0).whitespace_normal().tooltip(card?.command || "")
             .child(active
               ? (card?.command ? card.command : "No command — set the layout's command, or shared proof.command")
               : "No space"))
